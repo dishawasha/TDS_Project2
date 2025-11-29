@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+pydantic
+requests
+playwright==1.48.0
+pandas
+google-genai
+numpy
+pdfplumber
+urllib3
+lxml
+httpx
+python-dotenv

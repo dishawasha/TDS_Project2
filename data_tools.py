@@ -1,3 +1,5 @@
+import zipfile       # <--- Add this line
+from PIL import Image # <--- Add this line
 import requests
 import pandas as pd
 from typing import Any, Optional
@@ -43,6 +45,20 @@ def download_file_content(url: str) -> Optional[bytes]:
         # Use requests for static file download
         response = requests.get(url, timeout=30)  # increased timeout for robustness
         response.raise_for_status()
+        # --- NEW: Smart GitHub Fetcher ---
+        if url.endswith("gh-tree.json"):
+            try:
+                print("    [Info] Detected GitHub Config. Fetching full tree...")
+                config = response.json()
+                owner, repo, sha = config.get("owner"), config.get("repo"), config.get("sha")
+                if owner and repo and sha:
+                    gh_url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{sha}?recursive=1"
+                    gh_res = requests.get(gh_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+                    gh_res.raise_for_status()
+                    return gh_res.content # Return the actual file list, not the config
+            except Exception as e:
+                print(f"    [Warning] GitHub auto-fetch failed: {e}")
+        # ---------------------------------
         return response.content
     except Exception as e:
         print(f"Error downloading file {url}: {e}")
@@ -179,6 +195,42 @@ def process_data(data_content: Any, source_type: str, analysis_plan: str) -> Opt
     if data_content is None:
         return None
 
+    # --- NEW: ZIP Handling ---
+    if source_type == "zip" or (isinstance(data_content, bytes) and data_content.startswith(b'PK\x03\x04')):
+        try:
+            with zipfile.ZipFile(io.BytesIO(data_content)) as z:
+                # Find the first useful file (CSV, JSON, LOG, TXT)
+                for filename in z.namelist():
+                    if filename.endswith(('.csv', '.json', '.jsonl', '.txt', '.log', '.md')):
+                        print(f"    [Info] Extracting {filename} from zip")
+                        with z.open(filename) as f:
+                            # Recursively process the extracted file
+                            ext = filename.split('.')[-1]
+                            if ext in ['log', 'jsonl']: ext = 'json'
+                            return process_data(f.read(), ext, analysis_plan)
+        except Exception: pass
+
+    # --- NEW: IMAGE Handling (Heatmap Fix) ---
+    if source_type in ["png", "image"] and isinstance(data_content, bytes):
+        try:
+            img = Image.open(io.BytesIO(data_content))
+            # Get colors. maxcolors must be > unique colors in image
+            colors = img.getcolors(maxcolors=2000000) 
+            if colors:
+                # Sort by count (descending)
+                colors.sort(key=lambda x: x[0], reverse=True)
+                most_freq_count, most_freq_color = colors[0]
+                
+                # Handle RGB vs RGBA
+                r, g, b = most_freq_color[:3]
+                hex_color = '#{:02x}{:02x}{:02x}'.format(r, g, b)
+                
+                print(f"    [Success] Analyzed Image. Most frequent color: {hex_color}")
+                return hex_color
+        except Exception as e:
+            print(f"    [Error] Image analysis failed: {e}")
+
+    # --- Existing PDF Check ---
     if source_type == "pdf":
         try:
             with pdfplumber.open(io.BytesIO(data_content)) as pdf:
@@ -199,9 +251,11 @@ def process_data(data_content: Any, source_type: str, analysis_plan: str) -> Opt
             if isinstance(data_content, bytes):
                 # Prepare data stream for Pandas
                 data_io = io.BytesIO(data_content)
+                content_str = data_content.decode('utf-8', errors='ignore') # <--- Added this
             else:
                 # Use string data as input stream
-                data_io = io.StringIO(str(data_content))
+                content_str = str(data_content) # <--- Added this
+                data_io = io.StringIO(content_str)
 
             if source_type == "csv":
                 
@@ -251,13 +305,24 @@ def process_data(data_content: Any, source_type: str, analysis_plan: str) -> Opt
                 df = df.dropna(how='all') # Remove entirely empty rows
                 # --- END ROBUST CSV PARSING (FIXED) ---
                 
-            else:  # json
-                # Note: data_io is a StringIO object if the input was not bytes
-                data_string = data_io.read() if isinstance(data_io, io.StringIO) else data_content.decode('utf-8', errors='ignore')
-                obj = json.loads(data_string)
-                if isinstance(obj, dict):
-                    df = pd.DataFrame([obj])
-                else:
+            else:
+                # JSON / JSONL
+                try:
+                    obj = json.loads(content_str)
+                    
+                    # --- FIX: Flatten GitHub Tree ---
+                    # If the JSON has a "tree" list (standard GitHub API), use that as the data
+                    if isinstance(obj, dict) and "tree" in obj and isinstance(obj["tree"], list):
+                        print("    [Info] Flattened GitHub Tree JSON to expose file list.")
+                        df = pd.DataFrame(obj["tree"])
+                    # --------------------------------
+                    elif isinstance(obj, list):
+                        df = pd.DataFrame(obj)
+                    else:
+                        df = pd.DataFrame([obj])
+                except:
+                    # JSONL fallback
+                    obj = [json.loads(line) for line in content_str.splitlines() if line.strip()]
                     df = pd.DataFrame(obj)
 
             print(f"    [Success: Data loaded into DataFrame. Columns: {list(df.columns)}]")
@@ -265,7 +330,14 @@ def process_data(data_content: Any, source_type: str, analysis_plan: str) -> Opt
         except Exception as e:
             print(f"    [Error: Failed to load data into DataFrame: {e}]")
             # If pandas/cleaning fails, return the raw text for the LLM to interpret
-            return data_string
+            return str(data_content)
+
+    # --- 5. SQL Handling ---
+    if source_type == "sql":
+        try:
+            return data_content.decode('utf-8', errors='ignore')
+        except:
+            return str(data_content)
 
     elif source_type in ["text", "page_content"]:
         print("    [Success: Data is page text. Ready for LLM re-prompt.]")

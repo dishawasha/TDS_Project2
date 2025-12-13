@@ -82,7 +82,7 @@ async def find_data_urls_on_page(page, quiz_url: str) -> Dict[str, Optional[str]
 
     results = await page.evaluate('''() => {
         const audioExtensions = ['.mp3', '.wav', '.ogg', '.opus', '.flac', '.aac'];
-        const dataExtensions = ['.csv', '.json', '.pdf', '.txt'];
+        const dataExtensions = ['.csv', '.json', '.pdf', '.txt', '.zip', '.log'];
         let audio_url = null;
         let csv_url = null;
         
@@ -137,6 +137,50 @@ def execute_pandas_analysis(df: pd.DataFrame, plan: str) -> Optional[Union[int, 
     to bypass the unstable df.query() numexpr engine and the "Unsupported operator" error.
     """
     plan_lower = plan.lower()
+
+    # --- NEW: HANDLE JSON FORMATTING TASKS DIRECTLY ---
+    # Only run this if it's a PURE formatting task (no counting/summing requested)
+    if "json" in plan_lower and ("convert" in plan_lower or "format" in plan_lower) and "count" not in plan_lower and "sum" not in plan_lower:
+        try:
+            print("-> Pandas Analysis: Detected JSON formatting task. Executing via Pandas...")
+            # 1. Normalize Columns (Snake Case)
+            df.columns = [c.lower().strip().replace(' ', '_') for c in df.columns]
+            
+            # 2. Rename specific columns to match requirements if needed
+            # Common variations: 'id', 'name', 'joined', 'value'
+            # If columns are like 'id', 'name', 'joined_date', 'value', rename 'joined_date' -> 'joined'
+            rename_map = {}
+            for col in df.columns:
+                if 'joined' in col: rename_map[col] = 'joined'
+                if 'date' in col and 'joined' not in col: rename_map[col] = 'joined'
+            if rename_map:
+                df = df.rename(columns=rename_map)
+
+            # 3. Standardize Dates (ISO 8601 YYYY-MM-DD)
+            if 'joined' in df.columns:
+                # Try converting with dayfirst=False (Month-First default for US/International mix)
+                # If that fails or looks wrong, the loop logic in solver.py (re-attempt) won't help here 
+                # unless we expose it. For now, standard pd.to_datetime usually handles 'YYYY-MM-DD' and 'DD Month YYYY' well.
+                # The ambiguous '02/01/24' is the killer. 
+                # Strategy: Use mixed inference. Set dayfirst=True to match "1 Feb 2024" style context.
+                df['joined'] = pd.to_datetime(df['joined'], dayfirst=True, errors='coerce').dt.strftime('%Y-%m-%d')
+
+            # 4. Ensure Integers
+            if 'value' in df.columns:
+                df['value'] = pd.to_numeric(df['value'], errors='coerce').fillna(0).astype(int)
+            if 'id' in df.columns:
+                df['id'] = pd.to_numeric(df['id'], errors='coerce').fillna(0).astype(int)
+                # 5. Sort by ID
+                df = df.sort_values(by='id')
+
+            # 6. Export to JSON String (list of objects)
+            json_output = df.to_json(orient='records', indent=2)
+            print(f"-> Pandas Analysis SUCCESS: Generated JSON length {len(json_output)}")
+            return json_output
+
+        except Exception as e:
+            print(f"-> Pandas Analysis JSON Error: {e}")
+            return None
     
     # 1. Check for necessary keywords and the expected column 'value'
     if "filter" in plan_lower and "sum" in plan_lower and "value" in df.columns.tolist():
@@ -278,6 +322,8 @@ async def quiz_loop(email: str, secret: str, initial_url: str, start_time: float
     current_url = initial_url
     
     while current_url:
+        start_time = time.time() # <--- RESETS TIMER FOR EVERY NEW QUESTION
+        time.sleep(12)
         quiz_url = current_url
         print(f"\n--- Processing Quiz URL: {quiz_url} ---")
         
@@ -311,7 +357,6 @@ async def quiz_loop(email: str, secret: str, initial_url: str, start_time: float
                     // Fixed: Double-escaping backslashes for Python string compliance
                     match = bodyText.match(/(https:\\/\\/[^"\\s]*submit[^"\\s]*)/i);
                     if (match && match[1]) return match[1];
-
                     // Fixed: Double-escaping backslashes for Python string compliance
                     match = bodyText.match(/(\\/\\w*submit\\w*)/i);
                     if (match && match[1]) return match[1];
@@ -320,9 +365,8 @@ async def quiz_loop(email: str, secret: str, initial_url: str, start_time: float
                 }''')
 
                 if not submit_url_match:
-                    print("FATAL ERROR: Could not find the submission URL on the page.")
-                    await browser.close()
-                    return
+                    print("WARNING: URL not found. Forcing default submit URL.")
+                    submit_url_match = "https://tds-llm-analysis.s-anand.net/submit"
 
                 # Resolve relative URLs
                 if submit_url_match.startswith('/'):
@@ -335,6 +379,7 @@ async def quiz_loop(email: str, secret: str, initial_url: str, start_time: float
                 
                 # --- START ATTEMPTS LOOP ---
                 attempts = 0
+                previous_error = None
                 submission_result = {}
                 while attempts < MAX_ATTEMPTS: 
                     attempts += 1
@@ -387,7 +432,6 @@ async def quiz_loop(email: str, secret: str, initial_url: str, start_time: float
                         1. Identify the final answer type (number, string, etc.).
                         2. Identify the definitive data source.
                         3. The final data source URL should be either the CSV link: '{csv_url_found or 'NONE'}' or the literal string 'PAGE_CONTENT' if the instructions are in the audio transcript or embedded text.
-
                         **CRITICAL SCRAPING RULE:** If the answer is directly visible in the QUIZ CONTENT or TRANSCRIPT, or if the task is to scrape a new URL for a final text, the 'answer' field MUST be the **exact text extracted**. For the very first question, the answer is the text on the page, even if it looks like a placeholder (e.g., 'anything you want'). If an answer is NOT CALCULATED, use the string "NOT_CALCULATED".
                         
                         **CRITICAL EXTRACTION RULE:** If the audio transcript or quiz content mentions a 'cutoff value' or 'threshold', you MUST find the exact number from the context (e.g., '53122') and use that number in the 'analysis_plan'. Do NOT use a placeholder like 'X' or 'the cutoff value provided'.
@@ -401,12 +445,18 @@ async def quiz_loop(email: str, secret: str, initial_url: str, start_time: float
                             - `data_source_url`: URL of external data (e.g., CSV link) or "PAGE_CONTENT" if data is embedded in the quiz text/transcript, or "NONE".
                             - `source_type`: Type of data ('pdf', 'csv', 'json', 'text', 'page_content', 'NONE').
                             - `analysis_plan`: Step-by-step instructions for a data analyst (e.g., "Load CSV, filter by column X > 14687, then SUM column Y.").
-
                         QUIZ CONTENT:
                         ---
                         {quiz_content}
                         ---
                         {transcript_text}
+                        
+                        USER EMAIL: {email}  <--- ADD THIS LINE
+                        
+                        PREVIOUS ERROR (IF ANY):
+                        ---
+                        {previous_error}
+                        ---
                         """
                         
                         # FIX: WRAP BLOCKING SDK CALL IN ASYNCIO
@@ -432,18 +482,29 @@ async def quiz_loop(email: str, secret: str, initial_url: str, start_time: float
                         if url_match:
                             extracted_url = url_match.group(1).strip('.') # strip trailing dots if any
                             
-                            # Resolve the relative URL against the current quiz URL
-                            base_url = urllib.parse.urlunparse(urllib.parse.urlparse(quiz_url)[:2] + ('/', '', '', ''))
-                            #resolved_url = urllib.parse.urljoin(base_url, extracted_url)
-                            resolved_url = resolve_relative_url(quiz_url, extracted_url)
+                            # --- FIX: Ignore Template URLs ---
+                            if '{' in extracted_url or '}' in extracted_url:
+                                print(f"-> Ignoring template URL: {extracted_url}")
+                                extracted_url = "" 
+                            # ---------------------------------
 
-                            if resolved_url.lower() != quiz_url.lower():
-                                print(f"-> Source override: Plan mentions new data URL: {resolved_url}. Overriding data_source_url.")
-                                data_source_url = resolved_url
-                                # Ensure we don't accidentally treat this as a static CSV/PDF unless the extension is present
-                                if not resolved_url.lower().endswith(('.csv', '.pdf', '.json')):
-                                    source_type = "text"
-                            # else: the resolved URL is the current quiz URL, so proceed normally (PAGE_CONTENT)
+                            if '{' in extracted_url or '}' in extracted_url:
+                                print(f"-> Ignoring template URL: {extracted_url}")
+                                extracted_url = "" # Reset so we don't use it
+
+                            if extracted_url: # Only proceed if it's still valid
+                                # Resolve the relative URL against the current quiz URL
+                                base_url = urllib.parse.urlunparse(urllib.parse.urlparse(quiz_url)[:2] + ('/', '', '', ''))
+                                #resolved_url = urllib.parse.urljoin(base_url, extracted_url)
+                                resolved_url = resolve_relative_url(quiz_url, extracted_url)
+    
+                                if resolved_url.lower() != quiz_url.lower():
+                                    print(f"-> Source override: Plan mentions new data URL: {resolved_url}. Overriding data_source_url.")
+                                    data_source_url = resolved_url
+                                    # Ensure we don't accidentally treat this as a static CSV/PDF unless the extension is present
+                                    if not resolved_url.lower().endswith(('.csv', '.pdf', '.json')):
+                                        source_type = "text"
+                                # else: the resolved URL is the current quiz URL, so proceed normally (PAGE_CONTENT)
 
 
                         # 2. Check if the LLM's plan requires fetching a static external data file (CSV, PDF, JSON).
@@ -477,18 +538,28 @@ async def quiz_loop(email: str, secret: str, initial_url: str, start_time: float
                             is_static_file = (
                                 data_source_url.lower().endswith(".csv") or 
                                 data_source_url.lower().endswith(".pdf") or 
-                                data_source_url.lower().endswith(".json")
+                                data_source_url.lower().endswith(".json") or 
+                                data_source_url.lower().endswith(".zip") or 
+                                data_source_url.lower().endswith(".png") or
+                                data_source_url.lower().endswith(".opus") or
+                                data_source_url.lower().endswith(".sql")
                             )
 
                             if data_source_url.lower().endswith(".csv"):
                                 print(f"    [FINALDEBUG] Source Type: csv")
                                 source_type = "csv"
+                            elif data_source_url.lower().endswith(".png"):
+                                print(f"    [FINALDEBUG] Source Type: png")
+                                source_type = "png"
                             elif data_source_url.lower().endswith(".pdf"):
                                 print(f"    [FINALDEBUG] Source Type: pdf")
                                 source_type = "pdf"
                             elif data_source_url.lower().endswith(".json"):
                                 print(f"    [FINALDEBUG] Source Type: json")
                                 source_type = "json"
+                            elif data_source_url.lower().endswith(".sql"):
+                                print(f"    [FINALDEBUG] Source Type: sql")
+                                source_type = "sql"
 
                             is_static_file = is_static_file and not data_source_url.lower().endswith(('.mp3', '.wav', '.ogg', '.opus', '.flac', '.aac'))
                             print(f"    [FINALDEBUG] Is Static File: {is_static_file}")
@@ -539,15 +610,16 @@ async def quiz_loop(email: str, secret: str, initial_url: str, start_time: float
 
                                 if pandas_result is not None:
                                     final_answer = pandas_result
-                                    print(f"-> Pandas calculated final answer: {final_answer} (Bypassing LLM calculation for simple aggregation)")
+                                    print(f"-> Pandas calculated final answer: {str(final_answer)[:100]}... (Bypassing LLM)")
 
                                 elif extracted_data is not None:
                                     # Fallback to LLM Re-prompt if not a DataFrame or Pandas execution failed/not applicable
                                     
                                     # Prepare data for LLM re-prompt
                                     if isinstance(extracted_data, pd.DataFrame):
-                                        # Use to_string() for better numeric precision than to_markdown() if necessary
-                                        data_for_llm = extracted_data.head(50).to_string(index=False) 
+                                        print(f"    [Info] Converting DataFrame to CSV for LLM analysis...")
+                                        # Use to_csv to prevent formatting hallucinations and include ALL rows
+                                        data_for_llm = extracted_data.to_csv(index=False)
                                     elif isinstance(extracted_data, bytes):
                                          # Safely decode bytes for LLM
                                          data_for_llm = extracted_data[:4000].decode('latin-1', errors='replace')
@@ -561,16 +633,20 @@ async def quiz_loop(email: str, secret: str, initial_url: str, start_time: float
                                     # --- 3. RE-PROMPT LLM FOR FINAL ANALYSIS (SIMPLE TEXT OUTPUT) ---
                                     analysis_prompt = f"""
                                     The original quiz instruction was: "{analysis_plan}".
+                                    User Email: {email}
                                     
-                                    You have successfully extracted the following data (first 4000 chars/50 rows):
-                                    ---
+                                    DATA CONTEXT:
                                     {data_for_llm}
-                                    ---
                                     
-                                    CRITICAL INSTRUCTION: Analyze the data according to the instruction: "{analysis_plan}". 
-                                    If the task is to find a 'secret code', find the actual code and IGNORE any placeholder text like 'your secret' or 'your-email@example.com' that might be in the extracted data.
-                                    
-                                    OUTPUT ONLY the final numerical, string, or boolean answer. Do not output code, markdown, or any explanation.
+                                    CRITICAL INSTRUCTIONS:
+                                    1. Analyze the data to fulfill: "{analysis_plan}".
+                                    2. Output strictly valid JSON if the task asks for JSON. No markdown formatting.
+                                    3. Dates MUST be in YYYY-MM-DD format.
+                                    4. HANDLE AMBIGUITY: If a date is "02/01/24", it could be Feb 1st or Jan 2nd. 
+                                       Look at the other rows to infer the format (DD/MM/YY vs MM/DD/YY).
+                                       If previous attempts failed, switch your interpretation.
+                                       Normalize ALL dates strictly to YYYY-MM-DD.
+                                    5. OUTPUT ONLY the final result.
                                     """
 
                                     # FIX: WRAP BLOCKING SDK CALL IN ASYNCIO
@@ -581,7 +657,17 @@ async def quiz_loop(email: str, secret: str, initial_url: str, start_time: float
                                     )
                                     # The only fix here is adding .text to handle potential None return from llm_response if the API failed, 
                                     # preventing the 'NoneType' object has no attribute 'strip' error from the first quiz attempt.
-                                    final_answer = analysis_response.text.strip().strip('"`') if analysis_response.text else None
+                                    if analysis_response.text:
+                                        # Clean up markdown formatting (```json ... ```)
+                                        raw = analysis_response.text.strip()
+                                        if "```" in raw:
+                                            raw = raw.replace("```json", "").replace("```", "")
+                                        # Also remove raw "json" if it appears at the start
+                                        if raw.startswith("json"):
+                                            raw = raw[4:]
+                                        final_answer = raw.strip()
+                                    else:
+                                        final_answer = None
                                 else:
                                     print("ERROR: Data processing/extraction failed.")
                                     continue
@@ -644,6 +730,7 @@ async def quiz_loop(email: str, secret: str, initial_url: str, start_time: float
                         else:
                             error_message = submission_result.get("reason", "Unknown error") # Use 'reason' from the log
                             print(f"-> ANSWER INCORRECT. ❌ Message: {error_message}")
+                            previous_error = error_message # <--- ADD THIS LINE
                             
                             # Continue to next attempt, or break loop if MAX_ATTEMPTS reached
                             if attempts >= MAX_ATTEMPTS:
@@ -658,10 +745,15 @@ async def quiz_loop(email: str, secret: str, initial_url: str, start_time: float
                     except Exception as e:
                         print(f"Quiz loop attempt {attempts} failed with unexpected error: {e}")
                         
+                        # --- CRITICAL FIX: Wait 60s before retrying if an error occurs ---
+                        print("    [Info] Waiting 60 seconds before retrying...")
+                        time.sleep(60)
+                        # -----------------------------------------------------------------
+
                         if attempts >= MAX_ATTEMPTS:
                             print("MAX ATTEMPTS REACHED. Aborting current URL.")
                             await browser.close()
-                            return # Quit the entire quiz loop on fatal error
+                            return
 
         except Exception as e:
             print(f"An unexpected error occurred in quiz_loop setup or outer loop: {e}")
